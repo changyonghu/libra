@@ -7,10 +7,25 @@ use std::time::Instant;
 pub const TRACE_EVENT: &str = "trace_event";
 pub const TRACE_EDGE: &str = "trace_edge";
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+// This is poor's man AtomicReference from crossbeam
+// It have few unsafe lines, but does not require extra dependency
+// Sampling rate is the form of (nominator, denominator)
+static mut TXN_SAMPLING_RATE: (u64, u64) = (1, 100);
+static mut BLOCK_SAMPLING_RATE: (u64, u64) = (1, 1);
+static LIBRA_TRACE_STATE: AtomicUsize = AtomicUsize::new(UNINITIALIZED);
+const UNINITIALIZED: usize = 0;
+const INITIALIZING: usize = 1;
+const INITIALIZED: usize = 2;
+
 #[macro_export]
 macro_rules! trace_event {
     ($stage:expr, $node:tt) => {
-        trace_event!($stage; {$crate::format_node!($node), module_path!(), Option::<u64>::None})
+        let node = $crate::format_node!($node);
+        if $crate::is_selected(node.to_string()) && $crate::libra_trace_set(){
+            trace_event!($stage; {node, module_path!(), Option::<u64>::None})
+        }
     };
     ($stage:expr; {$node:expr, $path:expr, $duration:expr}) => {
         $crate::json_log::send_json_log($crate::json_log::JsonLogEntry::new(
@@ -79,30 +94,36 @@ impl Drop for TraceBlockGuard {
 #[macro_export]
 macro_rules! end_trace {
     ($stage:expr, $node:tt) => {
-        $crate::json_log::send_json_log($crate::json_log::JsonLogEntry::new(
-            $crate::libra_trace::TRACE_EVENT,
-            serde_json::json!({
-               "path": module_path!(),
-               "node": $crate::format_node!($node),
-               "stage": $stage,
-               "end": true,
-            }),
-        ));
+        let node = $crate::format_node!($node);
+        if $crate::is_selected(node.to_string()) {
+            $crate::json_log::send_json_log($crate::json_log::JsonLogEntry::new(
+                $crate::libra_trace::TRACE_EVENT,
+                serde_json::json!({
+                    "path": module_path!(),
+                    "node": node,
+                    "stage": $stage,
+                    "end": true,
+                }),
+            ));
+        }
     };
 }
 
 #[macro_export]
 macro_rules! trace_edge {
     ($stage:expr, $node_from:tt, $node_to:tt) => {
-        $crate::json_log::send_json_log($crate::json_log::JsonLogEntry::new(
-            $crate::libra_trace::TRACE_EDGE,
-            serde_json::json!({
-               "path": module_path!(),
-               "node": $crate::format_node!($node_from),
-               "node_to": $crate::format_node!($node_to),
-               "stage": $stage,
-            }),
-        ));
+        let node_from = $crate::format_node!($node_from);
+        if $crate::is_selected(node_from.to_string()) {
+            $crate::json_log::send_json_log($crate::json_log::JsonLogEntry::new(
+                $crate::libra_trace::TRACE_EDGE,
+                serde_json::json!({
+                    "path": module_path!(),
+                    "node": node_from,
+                    "node_to": $crate::format_node!($node_to),
+                    "stage": $stage,
+                }),
+            ));
+        }
     };
 }
 
@@ -294,5 +315,49 @@ fn abbreviate_crate(name: &str) -> &str {
     match name {
         "admission_control_service" => "ac",
         _ => name,
+    }
+}
+
+// This is exact copy of similar function in log crate
+/// Sets structured logger
+pub fn set_libra_trace(
+    txn_sampling_rate: (u64, u64),
+    block_sampling_rate: (u64, u64),
+) -> Result<(), ()> {
+    unsafe {
+        match LIBRA_TRACE_STATE.compare_and_swap(UNINITIALIZED, INITIALIZING, Ordering::SeqCst) {
+            UNINITIALIZED => {
+                TXN_SAMPLING_RATE = txn_sampling_rate;
+                BLOCK_SAMPLING_RATE = block_sampling_rate;
+                LIBRA_TRACE_STATE.store(INITIALIZED, Ordering::SeqCst);
+                Ok(())
+            }
+            INITIALIZING => {
+                while LIBRA_TRACE_STATE.load(Ordering::SeqCst) == INITIALIZING {}
+                Err(())
+            }
+            _ => Err(()),
+        }
+    }
+}
+
+/// Checks if libra trace is enabled
+pub fn libra_trace_set() -> bool {
+    LIBRA_TRACE_STATE.load(Ordering::SeqCst) == INITIALIZED
+}
+
+pub fn is_selected(s: String) -> bool {
+    let v = s.split("::").collect::<Vec<&str>>();
+    if v.len() != 2 && v.len() != 3 {
+        panic!("Invalid node format");
+    }
+    if v[0] == "txn" {
+        // Take the leading 6 hex of account address to hash
+        let num = u64::from_str_radix(&v[1][0..6], 16).expect("ERROR from trace 1");
+        unsafe { num % TXN_SAMPLING_RATE.1 < TXN_SAMPLING_RATE.0 }
+    } else {
+        // Take the leading 6 hex of block hashvalue to hash
+        let num = u64::from_str_radix(&v[1][0..6], 16).expect("ERROR from trace 2");
+        unsafe { num % BLOCK_SAMPLING_RATE.1 < BLOCK_SAMPLING_RATE.0 }
     }
 }
